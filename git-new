@@ -1,0 +1,35 @@
+#! /bin/sh
+
+# Set git root
+GITROOT='/var/www/git'
+
+# make sure we have repository to create
+if [ $# -le 0 ]; then
+	echo "Usage: $0 repository"
+	exit 1
+fi
+
+# Switch to directory
+cd $GITROOT
+
+# Handle args
+for repo in $@; do
+	if [ -d "$GITROOT/$repo" ]; then
+		echo "Warning: $GITROOT/$repo already exists"
+	else
+		# Create directory
+		mkdir "$GITROOT/$repo"
+		# Switch to directory
+		pushd "$GITROOT/$repo" > /dev/null
+		# Init bare repository
+		git --bare init --shared --initial-branch=master . > /dev/null
+		# Make it work
+		git update-server-info
+		# Allow push
+		git config http.receivepack true
+		# Fix ownership
+		chown -R apache:apache .
+		# Return in old dir
+		popd > /dev/null
+	fi
+done

@@ -1,0 +1,382 @@
+#! /usr/bin/perl
+
+use strict;
+use warnings;
+
+#Load IPC::System::Simple
+use IPC::System::Simple qw(capturex);
+
+#Load Data::Validate::IP
+use Data::Validate::IP qw(is_ipv4 is_ipv6);
+
+#Load NetAddr::IP::Util
+use NetAddr::IP::Util qw(shiftleft inet_4map6 ipv4to6);
+
+#Load NetAddr::IP
+use NetAddr::IP qw(:nofqdn Ones);
+
+#Load POSIX
+use POSIX qw(EXIT_SUCCESS EXIT_FAILURE);
+
+#Load Data::Dumper
+use Data::Dumper;
+
+#use Net::CIDR qw(range2cidr);
+#use Socket;
+#use Data::Dump qw(dump);
+
+#IP v4 hash
+my %ip4s = ();
+#IP v6 hash
+my %ip6s = ();
+#Blacklist v4 array
+my @blrule4s = ();
+#Blacklist v6 array
+my @blrule6s = ();
+
+#Init block list
+my $blocklist = 0;
+
+#Init spam list
+my $spamlist = 1;
+
+#Filter options
+@ARGV = map {
+	if ($_ eq '-b' || $_ eq '--blocklist') {
+		$blocklist = 1; ();
+	} elsif ($_ eq '-nb' || $_ eq '--noblocklist') {
+		$blocklist = 0; ();
+	} elsif ($_ eq '-s' || $_ eq '--spamlist') {
+		$spamlist = 1; ();
+	} elsif ($_ eq '-ns' || $_ eq '--nospamlist') {
+		$spamlist = 0; ();
+	} else {
+		$_;
+	}
+} @ARGV;
+
+#Show usage with invalid argument
+if (scalar(@ARGV)) {
+	print "Usage: $0 [-b|--blocklist|-nb|--noblocklist|-s|--spamlist|-ns|--nospamlist]\n";
+	exit EXIT_FAILURE;
+}
+
+#IP whitelist
+#my $iplist = qr/^(?:127\.|::1|2a01:4f8:190:22a6:|5\.9\.143\.173|85\.68\.|81\.67\.|89\.157\.|82\.241\.255\.46)/;
+my %iplist = (
+	ipv4 => [
+		#Localhost
+		'127.0.0.0/8',
+		#Aurae
+		'144.76.27.210/32',
+		#Toulouse
+		'82.241.255.46/32',
+		#Akasha
+		#'89.157.132.244/32'
+		#'89.3.145.115/32'
+		'89.3.147.209/32',
+		#Hotel recamier (because of port scan)
+		'92.154.96.153/32',
+		#Ygg tracker (tracker.yggtracker.cc)
+		'31.220.0.116/32',
+		#Coppersurfer tracker (tracker.coppersurfer.tk)
+		'31.14.40.30/32',
+		#Pussytorrent tracker (tracker.pussytorrents.org)
+		'217.23.12.105/32'
+	],
+	ipv6 => [
+		#Localhost
+		'::1/32',
+		#Aurae
+		'2a01:4f8:191:1405::/64'
+	]
+);
+
+#IP blacklist
+my %ipblist = (
+	ipv4 => [
+		#Trident media guard
+		'82.138.74.0/25',
+		'82.138.70.128/26',
+		'91.189.104.0/21',
+		'154.45.216.128/25',
+		'193.107.240.0/22'
+	],
+	ipv6 => [
+	]
+);
+
+#Create a new NetAddr::IP object without calling slow gethostbyname (load /etc/resolv.conf)
+sub new_ipv4($) {
+	#Extract ip and mask
+	my ($ip, $mask) = split('/', shift);
+	#Build base struct
+	my $self = {
+		#Set mask
+		mask => !defined($mask)||$mask==32?Ones:shiftleft(Ones, 32 - $mask),
+		#Mark as ipv4
+		isv6 => 0,
+		#Generate fake address
+		#XXX: NetAddr::IP expect a faked Socket6 gethostbyname struct
+		#XXX: see /usr/lib64/perl5/vendor_perl/NetAddr/IP/Util.pm +235
+		addr => inet_4map6(ipv4to6(pack('C4', split('\.', $ip))))
+	};
+	#Return fake NetAddr::IP object
+	return bless $self, 'NetAddr::IP';
+}
+
+#User whitelist
+my @userlist = ('rapsys', 'airlibre');
+
+#Port whitelist
+my %portlist = (
+	tcp => [ 80, 443, 8000, 8080, 8443 ],
+	udp => [ 443, 8443 ]
+);
+
+#Extract sshd.service scan
+#map {
+#	#Extract user and ip
+#	if (/Failed password for (?:invalid user )?(.+) from (.+) port [0-9]+ ssh2/ && grep($_ ne $1, @userlist)) {
+#		#Save ip
+#		my $ip = $2;
+#		#Check if v4 ip and not in whitelist
+#		if (is_ipv4($ip) && not scalar map { my $network = NetAddr::IP->new($_); my $netip = NetAddr::IP->new($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv4}}) {
+#			#Add ip in v4 blacklist
+#			$ip4s{$ip}=1;
+#		#Check if v6 ip
+#		} elsif (is_ipv6($ip) && not scalar map { my $network = NetAddr::IP->new($_); my $netip = NetAddr::IP->new($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv6}}) {
+#			$ip6s{$ip}=1;
+#		}
+#	}
+#} capturex('journalctl', '-u', 'sshd.service');
+
+#Extract kernel port scan
+map {
+	#XXX to ignore: net-fw DROP IN=enp3s0 OUT= MAC=50:46:5d:a1:a1:85:0c:86:10:f5:c6:4b:08:00 SRC=1.39.26.11 DST=144.76.27.210 LEN=348 TOS=0x00 PREC=0x00 TTL=51 ID=52475 PROTO=ICMP TYPE=3 CODE=3 [SRC=144.76.27.210 DST=1.39.26.11 LEN=320 TOS=0x00 PREC=0x00 TTL=47 ID=52473 PROTO=UDP SPT=6700 DPT=40992 LEN=300 ]
+	#net-fw DROP IN=enp3s0 OUT= MAC=50:46:5d:a1:a1:85:0c:86:10:f5:c6:4b:08:00 SRC=61.227.52.153 DST=144.76.27.210 LEN=52 TOS=0x00 PREC=0x00 TTL=116 ID=29123 DF PROTO=TCP SPT=64349 DPT=445 WINDOW=8192 RES=0x00 SYN URGP=0
+	#net-fw DROP IN=enp3s0 OUT= MAC=50:46:5d:a1:a1:85:0c:86:10:f5:c6:4b:08:00 SRC=110.34.70.110 DST=144.76.27.210 LEN=40 TOS=0x00 PREC=0x00 TTL=50 ID=17488 PROTO=TCP SPT=58225 DPT=34567 WINDOW=53283 RES=0x00 SYN URGP=0
+	if (/net-fw DROP .* SRC=([^\s]+) [^\[]* PROTO=(TCP|UDP) .* DPT=([^\s]+)/ && (! defined ${portlist}{lc($2)} || ! scalar map { unless ($_ eq $3) { (); } } @{$portlist{lc($2)}})) {
+		#Save ip
+		my $ip = $1;
+		#Save proto
+		my $proto = lc($2);
+		#Save dpt
+		my $dpt = $3;
+		#Check if v4 ip and not in whitelist
+		#if (is_ipv4($ip) && not scalar map { my $network = NetAddr::IP->new($_); my $netip = NetAddr::IP->new($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv4}}) {
+		if (is_ipv4($ip) && not scalar map { my $network = new_ipv4($_); my $netip = new_ipv4($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv4}}) {
+			if (!defined $ip4s{$ip}) {
+				%{$ip4s{$ip}} = ('tcp' => {}, 'udp' => {});
+			}
+			#Add ip in v4 blacklist
+			$ip4s{$ip}{$proto}{$dpt}=1;
+		} elsif (is_ipv6($ip) && not scalar map { my $network = NetAddr::IP->new($_); my $netip = NetAddr::IP->new($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv6}}) {
+			if (!defined $ip6s{$ip}) {
+				%{$ip6s{$ip}} = ('tcp' => {}, 'udp' => {});
+			}
+			#Add ip in v6 blacklist
+			$ip6s{$ip}{$proto}{$dpt}=1;
+		}
+	#XXX to ignore: imap-login: Disconnected: Inactivity (no auth attempts in 180 secs): user=<>, rip=92.154.96.153, lip=144.76.27.210, TLS handshaking, session=<86h+BZAE1VdcmmCZ>
+	#From journalctl -f -m -t dovecot -o cat --no-hostname | grep -E '^imap-login: Disconnected: .+ user=<(.+)>, .*rip=([^,]+)'
+	#imap-login: Disconnected: Aborted login by logging out (auth failed, 1 attempts in 6 secs): user=<laurence.gertz>, method=PLAIN, rip=103.199.18.128, lip=144.76.27.210, TLS, session=<D7/6qNABW7FnxxKA>
+	} elsif (/^imap-login: Disconnected: (?:Too many invalid commands|Aborted login by logging out|Connection closed \((?:auth failed, [0-9]+ attempts in [0-9]+ secs|tried to use unsupported auth mechanism)\)|Connection closed: (?:read\(size=[0-9]+\)|SSL_accept\(\)|SSL_read) failed).*? user=<(.*?)>, .*?rip=(.+?), / && grep($_ ne $1, @userlist)) {
+		#Save ip
+		my $ip = $2;
+		#Set blacklist for 143, 993, 4190 dest ports on tcp
+		my %blacklist = ('tcp' => [ 143, 993, 4190 ]);
+		#Check if v4 ip and not in whitelist
+		if (is_ipv4($ip) && not scalar map { my $network = new_ipv4($_); my $netip = new_ipv4($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv4}}) {
+			if (!defined $ip4s{$ip}) {
+				%{$ip4s{$ip}} = ('tcp' => {}, 'udp' => {});
+			}
+			#Add ip tuples in v4 blacklist
+			map { my $proto = $_; map { $ip4s{$ip}{$proto}{$_}=1; } @{$blacklist{$proto}}; } keys %blacklist;
+		#Check if v6 ip
+		} elsif (is_ipv6($ip) && not scalar map { my $network = NetAddr::IP->new($_); my $netip = NetAddr::IP->new($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv6}}) {
+			if (!defined $ip6s{$ip}) {
+				%{$ip6s{$ip}} = ('tcp' => {}, 'udp' => {});
+			}
+			#Add ip tuples in v6 blacklist
+			map { my $proto = $_; map { $ip6s{$ip}{$proto}{$_}=1; } @{$blacklist{$proto}}; } keys %blacklist;
+		}
+	#XXX to ignore: warning: non-SMTP command from lputeaux-656-1-79-153.w92-154.abo.wanadoo.fr[92.154.96.153]: GET / HTTP/1.1
+	#sudo journalctl -f -m -t postfix/smtpd -t postfix/submission/smtpd -t postfix/submissions/smtpd -t postfix/smtps/smtpd -o cat --no-hostname | grep -E '^(warning: Illegal address syntax from [^ ]+\[|warning: numeric hostname: |warning: [^ ]+\[|SSL_accept error from [^ ]+\[)([0-9a-f:\.]+)(|\]:? .*)$'
+	#sudo journalctl -f -m -t postfix/smtpd -t postfix/submission/smtpd -t postfix/submissions/smtpd -t postfix/smtps/smtpd -o cat --no-hostname | perl -pne 'if (/^(?:warning: Illegal address syntax from [^ ]+\[|warning: numeric hostname: |warning: [^ ]+\[|SSL_accept error from [^ ]+\[)([0-9a-f:\.]+)(?:|\]:? .*)$/) { print $1.":".$_; } else { }; undef $_;'
+	#warning: Illegal address syntax from unknown[113.80.102.166] in MAIL command: <quentin@blower,net>
+	#warning: numeric hostname: 187.145.20.160
+	#warning: non-SMTP command from unknown[2001:41d0:8:ed7b::1]: *
+	#warning: unknown[80.94.95.184]: SASL LOGIN authentication failed: UGFzc3dvcmQ6
+	#SSL_accept error from 162.194.196.104.bc.googleusercontent.com[104.196.194.162]: lost connection
+	#} elsif (/^warning: (?:.*\[(.+)\]: .+ authentication failed:.*|numeric hostname: (.+)|non-SMTP command from .*\[(.+)\]: .*|Illegal address syntax from .*\[(.+)\] in .+ command: .*)$/) {
+	} elsif (/^(?:warning: Illegal address syntax from [^ ]+\[|warning: numeric hostname: |warning: [^ ]+\[|SSL_accept error from [^ ]+\[)([0-9a-f:\.]+)(?:|\]:? .*)$/) {
+		#Save ip
+		my $ip = $1;
+		#Set blacklist for 25, 465, 587 dest ports on tcp
+		my %blacklist = ('tcp' => [ 25, 465, 587 ]);
+		#Check if v4 ip and not in whitelist
+		if (is_ipv4($ip) && not scalar map { my $network = new_ipv4($_); my $netip = new_ipv4($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv4}}) {
+			if (!defined $ip4s{$ip}) {
+				%{$ip4s{$ip}} = ('tcp' => {}, 'udp' => {});
+			}
+			#Add ip tuples in v4 blacklist
+			map { my $proto = $_; map { $ip4s{$ip}{$proto}{$_}=1; } @{$blacklist{$proto}}; } keys %blacklist;
+		#Check if v6 ip
+		} elsif (is_ipv6($ip) && not scalar map { my $network = NetAddr::IP->new($_); my $netip = NetAddr::IP->new($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv6}}) {
+			if (!defined $ip6s{$ip}) {
+				%{$ip6s{$ip}} = ('tcp' => {}, 'udp' => {});
+			}
+			#Add ip tuples in v6 blacklist
+			map { my $proto = $_; map { $ip6s{$ip}{$proto}{$_}=1; } @{$blacklist{$proto}}; } keys %blacklist;
+		}
+	#From journalctl -m -t sshd -o cat --no-hostname | grep -E '^Failed .+ for( invalid user)? (.+) from (.+) port [0-9]+ (ssh)2$'
+	#Failed keyboard-interactive/pam for invalid user supervisor from 168.0.232.246 port 26468 ssh2
+	#Failed password for invalid user mc from 103.38.4.238 port 37738 ssh2
+	} elsif (/^Failed .+ for(?: invalid user)? (.+) from (.+) port [0-9]+ ssh2$/ && grep($_ ne $1, @userlist)) {
+		#Save ip
+		my $ip = $2;
+		#Set blacklist for 22 dest port on tcp
+		my %blacklist = ('tcp' => [ 22 ]);
+		#Check if v4 ip and not in whitelist
+		if (is_ipv4($ip) && not scalar map { my $network = new_ipv4($_); my $netip = new_ipv4($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv4}}) {
+			if (!defined $ip4s{$ip}) {
+				%{$ip4s{$ip}} = ('tcp' => {}, 'udp' => {});
+			}
+			#Add ip tuples in v4 blacklist
+			map { my $proto = $_; map { $ip4s{$ip}{$proto}{$_}=1; } @{$blacklist{$proto}}; } keys %blacklist;
+		#Check if v6 ip
+		} elsif (is_ipv6($ip) && not scalar map { my $network = NetAddr::IP->new($_); my $netip = NetAddr::IP->new($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv6}}) {
+			if (!defined $ip6s{$ip}) {
+				%{$ip6s{$ip}} = ('tcp' => {}, 'udp' => {});
+			}
+			#Add ip tuples in v6 blacklist
+			map { my $proto = $_; map { $ip6s{$ip}{$proto}{$_}=1; } @{$blacklist{$proto}}; } keys %blacklist;
+		}
+	}
+} capturex('journalctl', '-m', '-t', 'kernel', '-t', 'dovecot', '-t', 'postfix/smtpd', '-t', 'postfix/submission/smtpd', '-t', 'postfix/submissions/smtpd', '-t', 'postfix/smtps/smtpd', '-t', 'sshd', '-o', 'cat', '--no-hostname');
+
+#With spamlist
+if ($spamlist) {
+	#Extract originating ip in spam
+	map {
+		#Open spam file for reading
+		open (my $fh, '<', $_) or die "Can't open < $_: $!";
+
+		#Lookup for X-Originating-IP header
+		while (<$fh>) {
+			if (/X-Originating-IP: (.+)$/) {
+				#Set ip
+				my $ip = ${1};
+				
+				#Set blacklist for 80 and 443 dest ports on tcp
+				#my %blacklist = ('tcp' => [ 80, 443, 8000, 8080, 8443 ]);
+				my %blacklist = %portlist;
+
+				#Check if v4 ip and not in whitelist
+				#if (is_ipv4($ip) && not scalar map { my $network = NetAddr::IP->new($_); my $netip = NetAddr::IP->new($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv4}}) {
+				if (is_ipv4($ip) && not scalar map { my $network = new_ipv4($_); my $netip = new_ipv4($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv4}}) {
+					if (!defined $ip4s{$ip}) {
+						%{$ip4s{$ip}} = ('tcp' => {}, 'udp' => {});
+					}
+					#Add ip tuples in v4 blacklist
+					map { my $proto = $_; map { $ip4s{$ip}{$proto}{$_}=1; } @{$blacklist{$proto}}; } keys %blacklist;
+				} elsif (is_ipv6($ip) && not scalar map { my $network = NetAddr::IP->new($_); my $netip = NetAddr::IP->new($ip); unless ($network->contains($netip)) { (); } } @{$iplist{ipv6}}) {
+					if (!defined $ip6s{$ip}) {
+						%{$ip6s{$ip}} = ('tcp' => {}, 'udp' => {});
+					}
+					#Add ip tuples in v6 blacklist
+					map { my $proto = $_; map { $ip6s{$ip}{$proto}{$_}=1; } @{$blacklist{$proto}}; } keys %blacklist;
+				}
+			}
+		}
+
+		#Close spam file
+		close $fh or die "Can't close fh: $!";
+	} glob('/var/spool/mail/*/.Junk/{new,cur,tmp}/*');
+}
+
+#Process each ipv4s keys
+map {
+	#Set proto as either tcp or udp
+	for my $proto (('tcp', 'udp')) {
+		#Check if branch is empty
+		if (!scalar keys %{$ip4s{$_}{$proto}}) {
+			#Prune it
+			delete $ip4s{$_}{$proto};
+		}
+	}
+} keys %ip4s;
+
+#Process each ipv6s keys
+map {
+	#Set proto as either tcp or udp
+	for my $proto (('tcp', 'udp')) {
+		#Check if branch is empty
+		if (!scalar keys %{$ip6s{$_}{$proto}}) {
+			#Prune it
+			delete $ip6s{$_}{$proto};
+		}
+	}
+} keys %ip6s;
+
+#Open blrule4s file for reading
+open (my $fh, '<', '/etc/shorewall/blrules') or die "Can't open < /etc/shorewall/blrules: $!";
+
+#Populate with comments
+@blrule4s = map { chomp($_); if (/^#/) { $_; } else { (); } } <$fh>;
+
+#Prepend each specific ip from whitelist
+map { push @blrule4s, "WHITELIST\tnet:$1\tall" if (/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\/32$/); } @{$iplist{ipv4}};
+
+#Prepend each specific ip from blacklist
+#TODO: check that blacklist range is not in a whitelisted one !!!
+map { push @blrule4s, "DROP\tnet:$1\tall" if (/^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2})$/); } @{$ipblist{ipv4}};
+
+#Close blrule4s file
+close $fh or die "Can't close fh: $!";
+
+#With blocklist
+if ($blocklist) {
+	#Open bt_blocklists.ipv4 file for reading
+	open ($fh, '<', '/usr/local/share/blacklist/shorewall.ipv4') or die "Can't open < /usr/local/share/blacklist/shorewall.ipv4: $!";
+
+	#Prepend bt_blocklists.ipv4 drop
+	map { chomp $_; push @blrule4s, "DROP\t\tnet:$_\tfw"; } <$fh>;
+
+	#Close bt_blocklists.ipv4 file
+	close $fh or die "Can't close fh: $!";
+}
+
+#Build blacklist
+map {
+	#Set proto from hash
+	for my $proto (sort keys %{$ip4s{$_}}) {
+		#Push rule
+		push @blrule4s, "DROP\t\tnet:".$_.(length($_)<12?"\t":'')."\tfw\t$proto\t".(scalar keys %{$ip4s{$_}{$proto}}>5||defined $ip4s{$_}{$proto}{0}?'#':'').join(",", sort { $a <=> $b } keys %{$ip4s{$_}{$proto}});
+	}
+} sort keys %ip4s;
+
+#Open blrule4s file for writing
+open ($fh, '>', '/etc/shorewall/blrules') or die "Can't open > /etc/shorewall/blrules: $!";
+
+#Inject content of blacklist
+map { print $fh $_."\n"; } @blrule4s;
+
+#Close blrule4s file
+close $fh or die "Can't close fh: $!";
+
+#Print ipv6 to update hash
+#XXX; right now it don't seems scanned at all...
+for (sort keys %ip6s) {
+	#Set proto from hash
+	for my $proto (keys %{$ip6s{$_}}) {
+		#Print the ipv6 scanner
+		print $_."\t$proto\t".join(",", keys %{$ip6s{$_}{$proto}})."\n";
+	}
+}
+
+# TODO: add ipv6 ?
+
+#Restart shorewall service
+capturex('systemctl', 'restart', 'shorewall.service');

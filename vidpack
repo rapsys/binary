@@ -1,0 +1,200 @@
+#! /bin/sh
+
+# Brighten
+#XXX: ffplay -vf "curves=all='0/0 0.25/0.375 0.5/0.75 0.75/0.875 1/1'" 
+
+#Set document directory
+docdir=/var/www/doc
+
+#Set video directory
+viddir=/var/www/video
+
+#Set temporary directory
+tmpdir=/tmp/vidpack
+
+#Without temporary directory
+if [ ! -d "$tmpdir" ]; then
+	#Create temporary directory or die
+	mkdir -p "$tmpdir" || exit 1;
+fi
+
+#Set time as utc
+export TZ=utc
+
+#Change to document directory
+pushd "$docdir" > /dev/null || exit 1
+
+#Iterate on each mov or mp4 in doc dir older than 1h
+for i in `find $docdir -maxdepth 1 -type f,l -name '*.mov' -o -name '*.mp4' -mmin +60`; do
+	#Set file date
+	fdate=$(date -u --rfc-3339=ns -r $i | perl -pne 's/\..*$/.000000Z/; s/ /T/');
+
+	#Without file date
+	if [ -z "$fdate" ]; then
+		#File date must exists
+		exit 1;
+	fi
+
+	#Set name date
+	#XXX: may miss if filename don't match /^(.*[^0-9])?YYYYMMDD[^0-9]?HHMMSS([^0-9].*)?$/
+	ndate=$(echo $i | perl -ne 'print if s/^(?:.*[^0-9])?([0-9]{4})([0-9]{2})([0-9]{2})(?:[^0-9])?([0-9]{2})([0-9]{2})([0-9]{2})(?:[^0-9].*)?$/\1-\2-\3T\4:\5:\6.000000Z/');
+
+	#Without name date
+	if [ -z "$ndate" ]; then
+		#Set name date
+		#XXX: catch when filename match only /^(.*[^0-9])?20YYMMDD([^0-9].*)?$/
+		ndate=$(echo $i | perl -ne 'print if s/^(?:.*[^0-9])?(20[0-9]{2})([0-9]{2})([0-9]{2})(?:[^0-9].*)?$/\1-\2-\3T00:00:00.000000Z/');
+	fi
+
+	#Set create date
+	cdate=$(ffprobe -hide_banner -v quiet -show_entries format_tags=date,creation_time,com.apple.quicktime.creationdate -of default=nokey=1:noprint_wrappers=1 -i $i | perl -ne '$l = $_ unless /^$/; END { chomp $l; print $l }');
+
+	#Set best date
+	date=$(echo -e "$fdate\n$ndate\n$cdate" | perl -ne '$l = $_ unless /^(0000:00:00 00:00:00|)$/; END { chomp $l; print $l }');
+
+	#Set dest filename
+	dest="$viddir/$(echo $date | perl -pne 's%^([0-9]{4})-([0-9]{2})-([0-9]{2}).*$%\1/\2/\3%')/$(echo ${i#$docdir/} | perl -pne 's/\.(?:mov|mp4)$//')";
+
+	#Without dest directory
+	if [ ! -d "$(dirname $dest)" ]; then
+		#Create dest directory or die
+		mkdir -p "$(dirname $dest)" || exit 1;
+	fi
+
+	#Set passlog filename
+	passlog="$tmpdir/$(echo $i | perl -pne 's%(?:.*/)([^/]+)\.(?:mov|mp4)$%\1%')";
+
+	#With passlog lock file
+	if [ -f "$passlog.lock" ]; then
+		#Display error
+		echo "Operation in progress: $passlog-0.log exists" 1>&2
+
+		#Exit with failure
+		exit 0;
+	fi
+
+	#Set location
+	#XXX: see https://stackoverflow.com/questions/65231616/what-is-the-difference-between-location-and-location-eng-metadata-of-a-mp4-f
+	#XXX: drop location name after /
+	location=$(ffprobe -hide_banner -v quiet -show_entries format_tags=location,location-eng,com.apple.quicktime.location.ISO6709 -of default=nokey=1:noprint_wrappers=1 -i $i 2> /dev/null | perl -ne 's/\/.*$/\//g; $l = $_ unless /^$/; END { chomp $l; print $l }')
+
+	#With location
+	if [ ! -z "$location" ]; then
+		#Replace with location arguments
+		location=" -metadata location=\"$location\"";
+	#Without location
+	else
+		#Prevent empty location
+		location="";
+	fi
+
+	#Set source rate
+	#TODO: use instead which works on webm: ffprobe -hide_banner -v quiet -select_streams v:0 -show_entries format=bit_rate -of default=nokey=1:noprint_wrappers=1 -i "$i" | perl -ne 'chomp; print'
+	sourcerate=$(ffprobe -hide_banner -v quiet -select_streams v:0 -show_entries stream=bit_rate -of default=nokey=1:noprint_wrappers=1 "$i" | perl -ne 'chomp; print');
+
+	#Set bitrate
+	bitrate=256k
+
+	#With sourcerate >= 5120k (1080p)
+	if [ $sourcerate -ge 5120000 ]; then
+		#Set bitrate
+		bitrate=5120k
+	#With sourcerate >= 2560k (720p)
+	elif [ $sourcerate -ge 2560000 ]; then
+		#Set bitrate
+		bitrate=2560k
+	#With sourcerate >= 1024k
+	elif [ $sourcerate -ge 1024000 ]; then
+		#Set bitrate
+		bitrate=1024k
+	#With sourcerate >= 512k
+	elif [ $sourcerate -ge 512000 ]; then
+		#Set bitrate
+		bitrate=512k
+	fi
+
+	#With dest.webm existing
+	if [ ! -f "$dest.webm" ]; then
+		#Create passlog lock file
+		touch "$passlog.lock"
+
+		#With 1080p sourcerate
+		if [ $sourcerate -ge 5120000 ]; then
+			#Set bitrate
+			bitrate=5120k
+
+			#First pass
+			ffmpeg -i $i -v error -passlogfile $passlog.1080p -c:v libvpx-vp9 -b:v $bitrate -pass 1 -an -f null /dev/null < /dev/null;
+
+			#With first pass
+			if [ $? = 0 ]; then
+				#Second pass
+				ffmpeg -y -i $i -v error -passlogfile $passlog.1080p -c:v libvpx-vp9 -b:v $bitrate -pass 2 -pix_fmt yuv420p -c:a libopus -movflags +faststart -metadata creation_time="$date"$location -fflags +bitexact $dest.1080p.webm < /dev/null;
+			fi
+
+			#With passlog file
+			if [ -f "$passlog.1080p-0.log" ]; then
+				#Remove passlog file
+				unlink "$passlog.1080p-0.log";
+			fi
+
+			#Set bitrate
+			bitrate=1024k
+		fi
+
+		#With sourcerate >= 2560k (720p)
+		if [ $sourcerate -ge 2560000 ]; then
+			#Set bitrate
+			bitrate=2560k
+
+			#First pass
+			ffmpeg -i $i -v error -passlogfile $passlog.720p -c:v libvpx-vp9 -b:v $bitrate -pass 1 -an -f null /dev/null < /dev/null;
+
+			#With first pass
+			if [ $? = 0 ]; then
+				#Second pass
+				ffmpeg -y -i $i -v error -passlogfile $passlog.720p -c:v libvpx-vp9 -b:v $bitrate -pass 2 -pix_fmt yuv420p -c:a libopus -movflags +faststart -metadata creation_time="$date"$location -fflags +bitexact $dest.720p.webm < /dev/null;
+			fi
+
+			#With passlog file
+			if [ -f "$passlog.720p-0.log" ]; then
+				#Remove passlog file
+				unlink "$passlog.720p-0.log";
+			fi
+
+			#Set bitrate
+			bitrate=1024k
+		fi
+
+		#First pass
+		ffmpeg -i $i -v error -passlogfile $passlog -c:v libvpx-vp9 -b:v $bitrate -pass 1 -an -f null /dev/null < /dev/null;
+
+		#With first pass
+		if [ $? = 0 ]; then
+			#Second pass
+			ffmpeg -y -i $i -v error -passlogfile $passlog -c:v libvpx-vp9 -b:v $bitrate -pass 2 -pix_fmt yuv420p -c:a libopus -movflags +faststart -metadata creation_time="$date"$location -fflags +bitexact $dest.webm < /dev/null;
+		fi
+
+		#With passlog file
+		if [ -f "$passlog-0.log" ]; then
+			#Remove passlog file
+			unlink "$passlog-0.log";
+		fi
+
+		#With passlog lock file
+		if [ -f "$passlog.lock" ]; then
+			#Remove passlog lock file
+			unlink "$passlog.lock";
+		fi
+
+	fi
+done
+
+#Revert to old dir
+popd > /dev/null || exit 1;
+
+#Remove temporary directory
+rmdir "$tmpdir" || true;
+
+#Exit with success
+exit 0;
